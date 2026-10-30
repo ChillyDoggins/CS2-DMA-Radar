@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CS2 Radar</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36; --text: #e6e8ee; --muted: #8a91a3;
+    --ct: #5aa9ff; --t: #f0a33a; --you: #4ade80; --dead: #555b69;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, sans-serif; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 20px; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  h1 { font-size: 16px; margin: 0; }
+  #map-name { font-weight: 600; }
+  #status { color: var(--muted); font-variant-numeric: tabular-nums; }
+  #status.bad { color: #f87171; }
+  label { color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  select { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 4px; padding: 2px 4px; }
+  main { display: flex; flex-direction: row-reverse; flex-wrap: wrap; gap: 16px; padding: 16px; }
+  #radar { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; width: min(720px, 100%); aspect-ratio: 1; display: block; }
+  table { border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; flex: 1; min-width: 300px; align-self: flex-start; font-variant-numeric: tabular-nums; }
+  th, td { padding: 6px 10px; text-align: right; border-bottom: 1px solid var(--line); }
+  th:nth-child(1), td:nth-child(1), th:nth-child(2), td:nth-child(2) { text-align: left; }
+  th { color: var(--muted); font-weight: 500; }
+  tr.dead td { color: var(--dead); }
+  .ct { color: var(--ct); } .t { color: var(--t); } .you { color: var(--you); }
+</style>
+</head>
+<body>
+<header>
+  <h1>CS2 Radar by Chilly Doggins</h1>
+  <span id="map-name">—</span>
+  <span id="status">Not Connected</span>
+  <label>View
+    <select id="view">
+      <option value="follow">Follow me</option>
+      <option value="map">Whole map</option>
+    </select>
+  </label>
+  <label>Zoom <input id="zoom" type="range" min="0.05" max="0.6" step="0.01" value="0.2"></label>
+  <label><input id="rotate" type="checkbox" checked> Rotate with view</label>
+</header>
+<main>
+  <canvas id="radar"></canvas>
+  <table>
+    <thead><tr><th>Team</th><th>Name</th><th>HP</th><th>AP</th><th>Dist</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</main>
+<script>
+// Valve radar calibration, from /maps.json (built from assets/overviews/*.txt):
+// pos_x/pos_y is the image's top-left corner in world units, scale is world
+// units per image pixel, and each section is a floor image picked by altitude.
+let MAPS = {};
+fetch('/maps.json').then(r => r.json()).then(maps => {
+  for (const m of Object.values(maps)) for (const s of m.sections) s.img = loadImage(s.image);
+  MAPS = maps;
+}).catch(() => {});
+
+// World bounds of a section's image (its pixel size times the map's scale).
+function bounds(m, img) {
+  const w = (ready(img) ? img.naturalWidth : 1024) * m.scale;
+  const h = (ready(img) ? img.naturalHeight : 1024) * m.scale;
+  return { xMin: m.pos_x, xMax: m.pos_x + w, yMin: m.pos_y - h, yMax: m.pos_y };
+}
+
+// Which floor a height is on: index of the section whose altitude range holds z.
+function sectionAt(m, z) {
+  const i = m.sections.findIndex(s => (s.min === null || z >= s.min) && (s.max === null || z < s.max));
+  return i < 0 ? 0 : i;
+}
+
+const ICONS = {
+  local: loadImage('/assets/icons/localPlayer_icon.png'),
+  enemy: loadImage('/assets/icons/enemy_icon.png'),
+  enemyOther: loadImage('/assets/icons/enemy_icon_hvd.png'),
+  mate: loadImage('/assets/icons/teammate_icon.png'),
+  mateOther: loadImage('/assets/icons/teammate_icon_hvd.png'),
+  mateColor: [0, 1, 2, 3, 4].map(i => loadImage(`/assets/icons/teammate_icon_${i}.png`)),
+};
+const ICON_SIZE = 30, ICON_ANCHOR_Y = 0.6625;  // circle centre sits below the pointer
+
+function loadImage(src) { const i = new Image(); i.src = src; return i; }
+const ready = img => img && img.complete && img.naturalWidth > 0;
+
+const canvas = document.getElementById('radar');
+const ctx = canvas.getContext('2d');
+const css = getComputedStyle(document.documentElement);
+const color = n => css.getPropertyValue(n).trim();
+const teamClass = t => t === 3 ? 'ct' : t === 2 ? 't' : '';
+const teamName = t => t === 3 ? 'CT' : t === 2 ? 'T' : t === 1 ? 'SPEC' : '?';
+const viewSel = document.getElementById('view');
+let data = { map: '', players: [] }, lastOk = 0;
+
+try { viewSel.value = localStorage.getItem('radar.view') || 'follow'; } catch (e) {}
+viewSel.onchange = () => { try { localStorage.setItem('radar.view', viewSel.value); } catch (e) {} };
+
+async function poll() {
+  try {
+    const r = await fetch('/players.json', { cache: 'no-store' });
+    data = await r.json();
+    lastOk = Date.now();
+  } catch (e) { /* server gone; status shows it */ }
+  setTimeout(poll, 100);
+}
+
+function fitCanvas() {
+  const dpr = window.devicePixelRatio || 1, size = Math.round(canvas.clientWidth * dpr);
+  if (canvas.width !== size) canvas.width = canvas.height = size;
+  return dpr;
+}
+
+function draw() {
+  const dpr = fitCanvas();
+  const W = canvas.width, H = canvas.height, cx = W / 2, cy = H / 2;
+  const players = data.players || [];
+  const me = players.find(p => p.local) || { x: 0, y: 0, z: 0, yaw: 90, team: 0 };
+  const map = MAPS[data.map];
+  const follow = viewSel.value === 'follow' || !map;
+
+  // Floor on multi-level maps, used for the image and the "other level" icons.
+  const floors = map ? map.sections.length : 1;
+  const level = p => floors > 1 ? sectionAt(map, p.z) : 0;
+  const sameLevel = p => floors > 1 ? level(p) === level(me) : Math.abs(p.z - me.z) < 200;
+  const img = map && map.sections[level(me)].img;
+  const mb = map && bounds(map, img);
+
+  // World -> screen. Follow: centred on you at the zoom slider's scale.
+  // Whole map: the radar image fills the canvas.
+  let centre, scale, rot = 0;
+  if (follow) {
+    centre = me;
+    scale = +document.getElementById('zoom').value * W / 640;
+    if (document.getElementById('rotate').checked) rot = (90 - me.yaw) * Math.PI / 180;
+  } else {
+    centre = { x: (mb.xMin + mb.xMax) / 2, y: (mb.yMin + mb.yMax) / 2 };
+    scale = W / Math.max(mb.xMax - mb.xMin, mb.yMax - mb.yMin);
+  }
+  const toScreen = (x, y) => {
+    const dx = x - centre.x, dy = y - centre.y;
+    const rx = dx * Math.cos(rot) - dy * Math.sin(rot);
+    const ry = dx * Math.sin(rot) + dy * Math.cos(rot);
+    return [cx + rx * scale, cy - ry * scale];
+  };
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  if (ready(img)) {
+    // Affine transform taking image pixels to screen via the map's world bounds.
+    const [ox, oy] = toScreen(mb.xMin, mb.yMax);  // top-left
+    const [ux, uy] = toScreen(mb.xMax, mb.yMax);  // top-right
+    const [vx, vy] = toScreen(mb.xMin, mb.yMin);  // bottom-left
+    const iw = img.naturalWidth, ih = img.naturalHeight;
+    ctx.setTransform((ux - ox) / iw, (uy - oy) / iw, (vx - ox) / ih, (vy - oy) / ih, ox, oy);
+    ctx.drawImage(img, 0, 0);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+  } else {
+    // Unknown map: range rings every 500 units around the centre.
+    ctx.strokeStyle = color('--line'); ctx.lineWidth = dpr;
+    for (let r = 1; r <= 6; r++) { ctx.beginPath(); ctx.arc(cx, cy, r * 500 * scale, 0, Math.PI * 2); ctx.stroke(); }
+    ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, H); ctx.moveTo(0, cy); ctx.lineTo(W, cy); ctx.stroke();
+  }
+
+  const iconSize = ICON_SIZE * dpr;
+  // Draw yourself last so you're on top.
+  for (const p of players.slice().sort((a, b) => a.local - b.local)) {
+    let [sx, sy] = toScreen(p.x, p.y);
+    // Pin anyone outside the radar to its edge, faded, so they're never lost.
+    const pad = 14 * dpr, edge = Math.max(Math.abs(sx - cx), Math.abs(sy - cy)) / (cx - pad);
+    ctx.globalAlpha = 1;
+    if (edge > 1) { sx = cx + (sx - cx) / edge; sy = cy + (sy - cy) / edge; ctx.globalAlpha = 0.5; }
+
+    if (!p.alive) {
+      const s = 5 * dpr;
+      ctx.strokeStyle = color('--dead'); ctx.lineWidth = 2 * dpr;
+      ctx.beginPath(); ctx.moveTo(sx - s, sy - s); ctx.lineTo(sx + s, sy + s); ctx.moveTo(sx + s, sy - s); ctx.lineTo(sx - s, sy + s); ctx.stroke();
+      continue;
+    }
+
+    const enemy = !p.local && p.team !== me.team;
+    const same = sameLevel(p);
+    const icon = p.local ? ICONS.local
+      : enemy ? (same ? ICONS.enemy : ICONS.enemyOther)
+      : !same ? ICONS.mateOther
+      : ICONS.mateColor[p.color] || ICONS.mate;
+
+    // Icons point up; game yaw is degrees counter-clockwise from +x.
+    const screenAngle = p.yaw * Math.PI / 180 + rot;
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(Math.PI / 2 - screenAngle);
+    if (ready(icon)) {
+      ctx.drawImage(icon, -iconSize / 2, -iconSize * ICON_ANCHOR_Y, iconSize, iconSize);
+    } else {
+      ctx.fillStyle = enemy ? '#e53935' : color('--you');
+      ctx.beginPath(); ctx.arc(0, 0, 6 * dpr, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+
+    ctx.font = `${12 * dpr}px system-ui`;
+    ctx.lineWidth = 3 * dpr; ctx.strokeStyle = 'rgba(0,0,0,0.75)';
+    const tx = sx + iconSize * 0.4, label = p.name, hp = `${p.health} hp`;
+    ctx.strokeText(label, tx, sy - 4 * dpr); ctx.fillStyle = color('--text'); ctx.fillText(label, tx, sy - 4 * dpr);
+    ctx.strokeText(hp, tx, sy + 10 * dpr); ctx.fillStyle = color('--muted'); ctx.fillText(hp, tx, sy + 10 * dpr);
+  }
+  ctx.globalAlpha = 1;
+
+  document.getElementById('map-name').textContent =
+    (data.map || 'no map') + (data.map && !map ? ' (no radar image)' : '') +
+    (floors > 1 ? ` · ${map.sections[level(me)].name === 'default' ? 'main floor' : map.sections[level(me)].name}` : '');
+  const age = Date.now() - lastOk;
+  const status = document.getElementById('status');
+  status.textContent = lastOk ? `${players.length} players · updated ${age} ms ago` : 'Not Connected';
+  status.className = age > 2000 ? 'bad' : '';
+
+  document.getElementById('rows').innerHTML = players
+    .slice().sort((a, b) => a.team - b.team || b.health - a.health)
+    .map(p => {
+      const dist = Math.hypot(p.x - me.x, p.y - me.y, p.z - me.z) / 39.37;  // units -> metres
+      const name = p.name.replace(/[&<>"]/g, ch => `&#${ch.charCodeAt(0)};`);
+      return `<tr class="${p.alive ? '' : 'dead'}">
+        <td class="${teamClass(p.team)}">${teamName(p.team)}</td>
+        <td class="${p.local ? 'you' : ''}">${name}</td>
+        <td>${p.health}</td><td>${p.armor}</td>
+        <td>${p.local ? '—' : dist.toFixed(0) + ' m'}</td></tr>`;
+    }).join('');
+
+  requestAnimationFrame(draw);
+}
+
+poll();
+draw();
+</script>
+</body>
+</html>
